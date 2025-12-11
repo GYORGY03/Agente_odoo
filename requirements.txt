@@ -1,0 +1,6 @@
+langchain>=0.3.0
+langchain-google-genai
+langchain-core
+python-dotenv
+python-telegram-bot
+mcp
