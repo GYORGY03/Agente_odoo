@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 class SearchProductsInput(BaseModel):
     """Input para búsqueda de productos"""
     query: Optional[str] = Field(default=None, description="Término de búsqueda para productos (nombre, referencia, código de barras)")
-    limit: int = Field(default=10, description="Límite de resultados")
+    limit: int = Field(default=50, description="Límite de resultados")
 
 
 class GetProductByIdInput(BaseModel):
@@ -41,27 +41,33 @@ class SearchProductsTool(BaseTool):
             if not products:
                 return f"No se encontraron productos{' con el término: ' + query if query else ''}."
             
-            # Formatear resultados
-            result = f"Se encontraron {len(products)} productos:\n\n"
+            # Formatear resultados con más detalle para diferenciar productos
+            result = f"Se encontraron {len(products)} producto(s):\n\n"
             
             for idx, product in enumerate(products, 1):
-                result += f"{idx}. {product.get('name')} (ID: {product.get('id')})\n"
+                result += f"══════════════════════════════════════\n"
+                result += f"#{idx} - {product.get('name')} (ID: {product.get('id')})\n"
+                result += f"══════════════════════════════════════\n"
                 
                 if product.get('default_code'):
-                    result += f"   Referencia: {product.get('default_code')}\n"
+                    result += f"📋 Referencia interna: {product.get('default_code')}\n"
                 if product.get('barcode'):
-                    result += f"   Código de barras: {product.get('barcode')}\n"
+                    result += f"🔢 Código de barras: {product.get('barcode')}\n"
                     
-                result += f"   Precio: ${product.get('list_price', 0):.2f}\n"
-                result += f"   Costo: ${product.get('standard_price', 0):.2f}\n"
-                result += f"   Stock disponible: {product.get('qty_available', 0)}\n"
+                result += f"💰 Precio de venta: ${product.get('list_price', 0):.2f}\n"
+                result += f"💵 Costo: ${product.get('standard_price', 0):.2f}\n"
+                result += f"📦 Stock disponible: {product.get('qty_available', 0)}\n"
                 
                 if product.get('categ_id'):
-                    result += f"   Categoría: {product['categ_id'][1]}\n"
+                    result += f"🏷️  Categoría: {product['categ_id'][1]}\n"
                 if product.get('uom_id'):
-                    result += f"   Unidad: {product['uom_id'][1]}\n"
+                    result += f"📏 Unidad: {product['uom_id'][1]}\n"
                     
                 result += "\n"
+            
+            # Si hay múltiples productos con el mismo nombre, avisar al usuario
+            if len(products) > 1:
+                result += "ℹ️  Se encontraron múltiples productos. Verifica la referencia interna para identificar el correcto.\n"
             
             return result
             

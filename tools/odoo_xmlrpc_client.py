@@ -1,8 +1,3 @@
-"""
-Cliente XML-RPC para Odoo 17
-Conexión directa a instancia de Odoo para leer/escribir datos
-"""
-
 import xmlrpc.client
 import logging
 from typing import List, Dict, Any, Optional
@@ -14,15 +9,7 @@ class OdooXMLRPCClient:
     """Cliente XML-RPC para conectarse a Odoo 17"""
     
     def __init__(self, url: str, db: str, username: str, password: str):
-        """
-        Inicializa el cliente de Odoo
-        
-        Args:
-            url: URL de la instancia de Odoo (ej: https://mycompany.odoo.com)
-            db: Nombre de la base de datos
-            username: Usuario de Odoo
-            password: Contraseña o API Key
-        """
+
         self.url = url
         self.db = db
         self.username = username
@@ -72,18 +59,7 @@ class OdooXMLRPCClient:
             return False
     
     def search(self, model: str, domain: List = None, offset: int = 0, limit: int = 100) -> List[int]:
-        """
-        Busca registros en un modelo
-        
-        Args:
-            model: Nombre del modelo (ej: 'product.product')
-            domain: Filtros de búsqueda (ej: [['type', '=', 'product']])
-            offset: Número de registros a saltar
-            limit: Número máximo de registros a retornar
-            
-        Returns:
-            Lista de IDs de registros
-        """
+
         if domain is None:
             domain = []
             
@@ -100,17 +76,7 @@ class OdooXMLRPCClient:
             return []
     
     def read(self, model: str, ids: List[int], fields: List[str] = None) -> List[Dict]:
-        """
-        Lee registros por IDs
-        
-        Args:
-            model: Nombre del modelo
-            ids: Lista de IDs a leer
-            fields: Lista de campos a retornar (None = todos)
-            
-        Returns:
-            Lista de diccionarios con los datos
-        """
+
         try:
             options = {}
             if fields:
@@ -129,19 +95,7 @@ class OdooXMLRPCClient:
     
     def search_read(self, model: str, domain: List = None, fields: List[str] = None, 
                     offset: int = 0, limit: int = 100) -> List[Dict]:
-        """
-        Busca y lee registros en una sola llamada
-        
-        Args:
-            model: Nombre del modelo
-            domain: Filtros de búsqueda
-            fields: Campos a retornar
-            offset: Número de registros a saltar
-            limit: Número máximo de registros
-            
-        Returns:
-            Lista de diccionarios con los datos
-        """
+
         if domain is None:
             domain = []
             
@@ -162,16 +116,7 @@ class OdooXMLRPCClient:
             return []
     
     def search_count(self, model: str, domain: List = None) -> int:
-        """
-        Cuenta registros que coinciden con el dominio
-        
-        Args:
-            model: Nombre del modelo
-            domain: Filtros de búsqueda
-            
-        Returns:
-            Número de registros
-        """
+
         if domain is None:
             domain = []
             
@@ -186,7 +131,7 @@ class OdooXMLRPCClient:
             logger.error(f"Error contando {model}: {e}")
             return 0
     
-    def get_products(self, query: str = None, limit: int = 10) -> List[Dict]:
+    def get_products(self, query: str = None, limit: int = 50) -> List[Dict]:
         """
         Obtiene productos del inventario
         
@@ -197,10 +142,6 @@ class OdooXMLRPCClient:
         Returns:
             Lista de productos con sus datos
         """
-        print(f"\n[ODOO CLIENT] get_products() llamado")
-        print(f"[ODOO CLIENT] query: '{query}', limit: {limit}")
-        print(f"[ODOO CLIENT] Autenticado: uid={self.uid}")
-        
         domain = []
         
         if query:
@@ -211,9 +152,6 @@ class OdooXMLRPCClient:
                 ['default_code', 'ilike', query],
                 ['barcode', 'ilike', query]
             ]
-            print(f"[ODOO CLIENT] Domain de búsqueda: {domain}")
-        else:
-            print(f"[ODOO CLIENT] Sin filtro de búsqueda (query=None)")
         
         fields = [
             'name',           # Nombre del producto
@@ -228,27 +166,13 @@ class OdooXMLRPCClient:
             'active',         # Activo
         ]
         
-        print(f"[ODOO CLIENT] Ejecutando search_read en product.product...")
         products = self.search_read('product.product', domain, fields, limit=limit)
-        print(f"[ODOO CLIENT] Productos encontrados: {len(products)}")
-        
-        if products:
-            print(f"[ODOO CLIENT] Primer producto: {products[0].get('name')}")
-        else:
-            print(f"[ODOO CLIENT] No se encontraron productos")
+        logger.info(f"Búsqueda: '{query}' - {len(products)} productos encontrados")
         
         return products
     
     def get_product_by_id(self, product_id: int) -> Dict:
-        """
-        Obtiene un producto específico por ID
-        
-        Args:
-            product_id: ID del producto
-            
-        Returns:
-            Diccionario con datos del producto
-        """
+
         fields = [
             'name', 'default_code', 'barcode', 'type', 'categ_id',
             'list_price', 'standard_price', 'qty_available', 'uom_id',
@@ -259,16 +183,7 @@ class OdooXMLRPCClient:
         return products[0] if products else {}
     
     def get_stock_quants(self, product_id: int = None, location_id: int = None) -> List[Dict]:
-        """
-        Obtiene información de stock por ubicación
-        
-        Args:
-            product_id: ID del producto (opcional)
-            location_id: ID de la ubicación (opcional)
-            
-        Returns:
-            Lista de quants (cantidades por ubicación)
-        """
+
         domain = []
         
         if product_id:
