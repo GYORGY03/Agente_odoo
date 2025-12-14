@@ -64,13 +64,11 @@ def execute_tool_call(tool_name: str, query: str = None, product_id: int = None,
 
 
 def detect_and_execute_tools(user_input: str) -> str:
-    """Detecta si se necesita usar herramientas y las ejecuta directamente"""
+    """
+    Detecta casos MUY SIMPLES y ejecuta búsqueda directa.
+    Para consultas complejas, retorna None y deja que el LLM decida.
+    """
     user_input_lower = user_input.lower()
-    
-    # Detectar búsqueda de productos
-    product_keywords = ['producto', 'productos', 'articulo', 'articulos', 'item', 'items', 'inventario', 'stock']
-    search_keywords = ['busca', 'buscar', 'encuentra', 'encontrar', 'muestra', 'mostrar', 'dame', 'lista', 'listar', 'detalle', 'detalles', 'info', 'información', 'informacion']
-    reference_keywords = ['referencia', 'ref', 'código', 'codigo', 'barcode', 'sku']
     
     # Palabras a excluir (no son búsquedas de productos)
     exclude_keywords = [
@@ -81,124 +79,50 @@ def detect_and_execute_tools(user_input: str) -> str:
         'start', 'comenzar', 'empezar'
     ]
     
-    is_product_query = any(kw in user_input_lower for kw in product_keywords)
-    is_search_query = any(kw in user_input_lower for kw in search_keywords)
-    is_reference_query = any(kw in user_input_lower for kw in reference_keywords)
-    
-    # Detectar si hay comillas (posible búsqueda directa)
-    has_quotes = bool(re.search(r"['\"]([^'\"]+)['\"]", user_input))
-    
-    # Detectar si el input parece un código de producto directamente
+    # Detectar si el input parece un código de producto directamente (solo el código, nada más)
     code_patterns = [
         r'^\s*([A-Z]+[_-]\d+)\s*$',      # Solo FURN_8888
         r'^\s*([A-Z]+\d+[_-]\d+)\s*$',   # Solo ABC123_456
     ]
-    looks_like_code = any(re.match(pattern, user_input.upper()) for pattern in code_patterns)
+    looks_like_code = False
+    extracted_code = None
+    for pattern in code_patterns:
+        match = re.match(pattern, user_input.upper())
+        if match:
+            looks_like_code = True
+            extracted_code = match.group(1)
+            break
     
-    # Detectar frases cortas que NO son saludos/preguntas (posible nombre de producto)
+    # Detectar frases muy cortas (1-3 palabras) que NO son saludos/preguntas
     is_excluded = any(excl in user_input_lower for excl in exclude_keywords)
-    is_question = user_input_lower.strip().startswith('¿') or '?' in user_input
+    is_question = '?' in user_input
     word_count = len(user_input.split())
     
-    # Es una frase corta potencial de búsqueda si:
-    # - Tiene 1-3 palabras
-    # - No contiene palabras excluidas
-    # - No es una pregunta
-    # - No tiene comandos (/)
-    is_short_phrase = (word_count <= 3 and 
-                      not is_excluded and 
-                      not is_question and 
-                      not user_input.startswith('/'))
+    is_very_short_phrase = (
+        word_count <= 3 and 
+        not is_excluded and 
+        not is_question and 
+        not user_input.startswith('/')
+    )
     
-    # CASO 1: Búsqueda automática directa
-    if is_reference_query or (is_product_query and is_search_query) or has_quotes or looks_like_code or is_short_phrase:
-        query = None
-        
-        # 1. Intentar extraer texto entre comillas
-        match = re.search(r"['\"]([^'\"]+)['\"]", user_input)
-        if match:
-            extracted = match.group(1)
-            
-            # Buscar código de producto dentro (debe contener números Y guiones/guiones bajos)
-            # Ejemplos válidos: FURN_8888, OL-001, ABC-123
-            code_patterns = [
-                r'\b([A-Z]+[_-]\d+)\b',      # FURN_8888, OL_123
-                r'\b([A-Z]+\d+[_-]\d+)\b',   # ABC123_456
-                r'\b([A-Z]+[_-]\d+[_-]\d+)\b'  # ABC_123_456
-            ]
-            
-            for pattern in code_patterns:
-                code_match = re.search(pattern, extracted.upper())
-                if code_match:
-                    query = code_match.group(1)
-                    break
-            
-            # Si no hay código, usar el texto completo limpio
-            if not query:
-                cleaned = extracted.lower()
-                keywords_to_remove = ['referencia', 'interna', 'ref', 'código', 'codigo', 'barcode', 'sku', ':', 'de', 'el', 'la']
-                for kw in keywords_to_remove:
-                    cleaned = cleaned.replace(kw, ' ')
-                query = ' '.join(cleaned.split()).strip()
-        
-        # 2. Intentar extraer códigos/referencias sin comillas
-        if not query:
-            # Si el input completo parece un código, usarlo directamente
-            for pattern in code_patterns:
-                code_match = re.match(pattern, user_input.upper())
-                if code_match:
-                    query = code_match.group(1)
-                    break
-            
-            # Si no, buscar código dentro del input
-            if not query:
-                search_patterns = [
-                    r'\b([A-Z]+[_-]\d+)\b',      # FURN_8888, OL-001
-                    r'\b([A-Z]+\d+[_-]\d+)\b',   # ABC123_456
-                ]
-                
-                for pattern in search_patterns:
-                    code_match = re.search(pattern, user_input.upper())
-                    if code_match:
-                        query = code_match.group(1)
-                        break
-        
-        # 3. Extraer después de palabras clave específicas
-        if not query:
-            patterns = [
-                r'referencia\s+interna[:\s]+(\S+)',  # "referencia interna: XXX"
-                r'referencia[:\s]+(\S+)',             # "referencia: XXX"
-                r'ref[:\s]+(\S+)',                    # "ref: XXX"
-                r'código[:\s]+(\S+)',                 # "código: XXX"
-                r'codigo[:\s]+(\S+)',                 # "codigo: XXX"
-                r'barcode[:\s]+(\S+)',                # "barcode: XXX"
-                r'sku[:\s]+(\S+)'                     # "sku: XXX"
-            ]
-            for pattern in patterns:
-                match = re.search(pattern, user_input_lower)
-                if match:
-                    query = match.group(1).strip('.,;:')
-                    break
-        
-        # 4. Limpieza inteligente del texto
-        if not query:
-            cleaned = user_input_lower
-            all_keywords = search_keywords + product_keywords + reference_keywords
-            all_keywords.extend(['con', 'el', 'la', 'los', 'las', 'de', 'del', 'en', 'un', 'una', 'interna', 'interno', ':'])
-            
-            for keyword in all_keywords:
-                cleaned = cleaned.replace(keyword, ' ')
-            
-            query = ' '.join(cleaned.split()).strip()
-        
-        # Si hay query válido, ejecutar búsqueda
-        if query and query.strip():
-            logger.info(f"Búsqueda de productos: '{query}'")
-            result = execute_tool_call("odoo_search_products", query=query)
-            return result
+    # SOLO activar detección automática para casos EXTREMADAMENTE SIMPLES:
+    # 1. Código directo: "FURN_8888"
+    # 2. Frase muy corta: "Drawer", "Office Lamp", "silla"
+    if looks_like_code:
+        # Caso 1: Código directo
+        logger.info(f"Búsqueda automática (código): '{extracted_code}'")
+        return execute_tool_call("odoo_search_products", query=extracted_code)
     
-    # Si no se detecta un caso específico, retornar None para usar el LLM
+    elif is_very_short_phrase:
+        # Caso 2: Frase muy corta sin contexto adicional
+        query = user_input.strip()
+        logger.info(f"Búsqueda automática (frase corta): '{query}'")
+        return execute_tool_call("odoo_search_products", query=query)
+    
+    # Para TODO lo demás (consultas con contexto, preguntas, referencias, etc.)
+    # retornar None y dejar que el LLM decida la query de búsqueda
     return None
+
 
 # Crear el agente conversacional
 if tools:

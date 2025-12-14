@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class SearchProductsInput(BaseModel):
     """Input para búsqueda de productos"""
-    query: Optional[str] = Field(default=None, description="Término de búsqueda para productos (nombre, referencia, código de barras)")
+    query: Optional[str] = Field(default=None, description="Término de búsqueda para productos (nombre, referencia, código de barras, o categoría)")
     limit: int = Field(default=50, description="Límite de resultados")
 
 
@@ -27,7 +27,11 @@ class SearchProductsTool(BaseTool):
     """Herramienta para buscar productos en Odoo"""
     name: str = "odoo_search_products"
     description: str = """Busca productos en el inventario de Odoo. 
-    Puedes buscar por nombre del producto, referencia interna o código de barras.
+    Puedes buscar por:
+    - Nombre del producto
+    - Referencia interna (código interno del producto)
+    - Código de barras
+    - Categoría del producto (ej: 'Office Furniture', 'All', 'Saleable', etc.)
     Retorna información como: nombre, precio, cantidad disponible, categoría, etc."""
     args_schema: Type[BaseModel] = SearchProductsInput
     

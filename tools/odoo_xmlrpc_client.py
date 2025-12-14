@@ -136,7 +136,7 @@ class OdooXMLRPCClient:
         Obtiene productos del inventario
         
         Args:
-            query: Término de búsqueda (busca en nombre, referencia, código de barras)
+            query: Término de búsqueda (busca en nombre, referencia, código de barras, categoría)
             limit: Número máximo de productos
             
         Returns:
@@ -145,12 +145,13 @@ class OdooXMLRPCClient:
         domain = []
         
         if query:
-            # Buscar en nombre, referencia interna o código de barras
+            # Buscar en nombre, referencia interna, código de barras o categoría
             domain = [
-                '|', '|',
+                '|', '|', '|',
                 ['name', 'ilike', query],
                 ['default_code', 'ilike', query],
-                ['barcode', 'ilike', query]
+                ['barcode', 'ilike', query],
+                ['categ_id.name', 'ilike', query]
             ]
         
         fields = [
