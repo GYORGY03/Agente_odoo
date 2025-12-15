@@ -1,6 +1,7 @@
 import os
 import logging
 import re
+import asyncio
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
@@ -8,272 +9,350 @@ from models.open_ai import model
 
 logger = logging.getLogger(__name__)
 
-# Herramientas del agente
-tools = []
-odoo_client = None
-tools_dict = {}  # Diccionario para acceso rápido a herramientas por nombre
+# Cliente MCP de Odoo
+mcp_client = None
+mcp_tools_info = []
 
-# Configuración de Odoo XML-RPC (conexión directa)
-ODOO_XMLRPC_ENABLED = os.getenv("ODOO_XMLRPC_ENABLED", "false").lower() == "true"
-ODOO_URL = os.getenv("ODOO_URL", "")
-ODOO_DB = os.getenv("ODOO_DB", "")
-ODOO_USERNAME = os.getenv("ODOO_USERNAME", "")
-ODOO_PASSWORD = os.getenv("ODOO_PASSWORD", "")
+# Configuración de Odoo MCP
+ODOO_MCP_ENABLED = os.getenv("ODOO_MCP_ENABLED", "false").lower() == "true"
+ODOO_MCP_SERVER_PATH = os.getenv("ODOO_MCP_SERVER_PATH", "")
 
-if ODOO_XMLRPC_ENABLED and all([ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD]):
+if ODOO_MCP_ENABLED and ODOO_MCP_SERVER_PATH:
     try:
-        from tools.odoo_xmlrpc_tools import create_odoo_xmlrpc_tools
-        logger.info(f"Inicializando herramientas de Odoo XML-RPC: {ODOO_URL}")
+        import httpx
+        logger.info(f"Inicializando cliente MCP de Odoo: {ODOO_MCP_SERVER_PATH}")
         
-        odoo_client, odoo_tools = create_odoo_xmlrpc_tools(
-            url=ODOO_URL,
-            db=ODOO_DB,
-            username=ODOO_USERNAME,
-            password=ODOO_PASSWORD,
-            auto_connect=True
-        )
-        tools.extend(odoo_tools)
-        # Crear diccionario para acceso rápido
-        tools_dict = {tool.name: tool for tool in tools}
-        logger.info(f"Herramientas de Odoo cargadas: {len(odoo_tools)}")
+        # Crear cliente HTTP simple para MCP
+        class SimpleMCPClient:
+            def __init__(self, server_url):
+                self.server_url = server_url.rstrip('/')
+                self.http_client = None
+                self.session_id = None
+                self._request_id = 0
+                self.tools = []
+            
+            def _get_next_id(self):
+                self._request_id += 1
+                return self._request_id
+            
+            async def connect(self):
+                """Conecta al servidor MCP"""
+                if self.http_client:
+                    return
+                
+                self.http_client = httpx.AsyncClient(timeout=30.0)
+                
+                # Inicializar sesión
+                response = await self.http_client.post(
+                    self.server_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": self._get_next_id(),
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "clientInfo": {"name": "telegram-bot", "version": "1.0"}
+                        }
+                    }
+                )
+                
+                if response.status_code == 200:
+                    self.session_id = response.headers.get('mcp-session-id')
+                    logger.info("Cliente MCP conectado exitosamente")
+                    
+                    # Obtener herramientas disponibles
+                    tools_resp = await self.http_client.post(
+                        self.server_url,
+                        json={"jsonrpc": "2.0", "id": self._get_next_id(), "method": "tools/list", "params": {}},
+                        headers={"mcp-session-id": self.session_id} if self.session_id else {}
+                    )
+                    
+                    if tools_resp.status_code == 200:
+                        result = tools_resp.json()
+                        if "result" in result and "tools" in result["result"]:
+                            self.tools = result["result"]["tools"]
+                            logger.info(f"Herramientas MCP disponibles: {len(self.tools)}")
+            
+            async def call_tool(self, tool_name, arguments):
+                """Llama a una herramienta MCP"""
+                if not self.http_client:
+                    await self.connect()
+                
+                response = await self.http_client.post(
+                    self.server_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": self._get_next_id(),
+                        "method": "tools/call",
+                        "params": {"name": tool_name, "arguments": arguments}
+                    },
+                    headers={"mcp-session-id": self.session_id} if self.session_id else {}
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if "result" in result:
+                        return result["result"]
+                
+                raise Exception(f"Error llamando herramienta: {response.status_code}")
+            
+            async def disconnect(self):
+                """Desconecta del servidor"""
+                if self.http_client:
+                    await self.http_client.aclose()
+                    self.http_client = None
+        
+        mcp_client = SimpleMCPClient(ODOO_MCP_SERVER_PATH)
+        mcp_tools_info = []
+        
+        # Flag para indicar que el cliente debe conectarse en el primer uso
+        mcp_client._needs_init = True
+        
+        logger.info(f"Cliente MCP configurado para: {ODOO_MCP_SERVER_PATH}")
         
     except Exception as e:
-        logger.error(f"Error cargando herramientas de Odoo: {e}")
-        logger.warning("El agente continuará sin herramientas de Odoo")
+        logger.error(f"Error inicializando cliente MCP: {e}")
+        logger.warning("El agente continuará sin herramientas MCP")
+        mcp_client = None
 
 
-def execute_tool_call(tool_name: str, query: str = None, product_id: int = None, limit: int = 50) -> str:
-    """Ejecuta una herramienta de Odoo"""
-    if tool_name not in tools_dict:
-        return f"Error: Herramienta '{tool_name}' no encontrada"
+async def execute_mcp_tool(tool_name: str, arguments: dict) -> str:
+    """Ejecuta una herramienta del servidor MCP"""
+    global mcp_tools_info
     
-    tool = tools_dict[tool_name]
+    if not mcp_client:
+        return "Error: Cliente MCP no disponible"
     
     try:
-        if tool_name == "odoo_search_products":
-            result = tool._run(query=query, limit=limit)
-        elif tool_name == "odoo_get_product_info":
-            result = tool._run(product_id=product_id)
-        else:
-            result = "Error: Herramienta no soportada"
+        # Inicializar el cliente si es necesario
+        if hasattr(mcp_client, '_needs_init') and mcp_client._needs_init:
+            logger.info("Inicializando conexión MCP...")
+            await mcp_client.connect()
+            mcp_tools_info = mcp_client.tools
+            mcp_client._needs_init = False
+            logger.info(f"Cliente MCP inicializado con {len(mcp_tools_info)} herramientas")
         
-        return result
+        result = await mcp_client.call_tool(tool_name, arguments)
+        
+        # Extraer contenido de la respuesta MCP
+        if isinstance(result, dict) and "content" in result:
+            content_list = result["content"]
+            if content_list and len(content_list) > 0:
+                return content_list[0].get("text", str(result))
+        
+        return str(result)
+        
     except Exception as e:
-        logger.error(f"Error ejecutando herramienta {tool_name}: {e}")
-        return f"Error ejecutando la búsqueda: {str(e)}"
+        logger.error(f"Error ejecutando herramienta MCP {tool_name}: {e}")
+        return f"Error: {str(e)}"
 
 
-def detect_and_execute_tools(user_input: str) -> str:
-    """
-    Detecta casos MUY SIMPLES y ejecuta búsqueda directa.
-    Para consultas complejas, retorna None y deja que el LLM decida.
-    """
+async def detect_and_execute_tools(user_input: str) -> str:
+    """Detecta casos simples y ejecuta búsqueda directa usando MCP"""
+    if not mcp_client:
+        return None
+    
     user_input_lower = user_input.lower()
     
-    # Palabras a excluir (no son búsquedas de productos)
+    # Palabras a excluir
     exclude_keywords = [
-        'hola', 'hello', 'hi', 'hey', 'buenas', 'buenos', 'buena', 'saludos',
-        'qué', 'que', 'cómo', 'como', 'cuándo', 'cuando', 'dónde', 'donde', 
-        'por qué', 'porque', 'quién', 'quien', 'cuál', 'cual',
-        'ayuda', 'help', 'gracias', 'thanks', 'ok', 'vale', 'si', 'no',
-        'start', 'comenzar', 'empezar'
+        'hola', 'hello', 'hi', 'hey', 'buenas', 'buenos', 'saludos',
+        'qué', 'que', 'cómo', 'como', 'ayuda', 'help', 'gracias', 'ok'
     ]
     
-    # Detectar si el input parece un código de producto directamente (solo el código, nada más)
+    # Detectar código de producto
     code_patterns = [
-        r'^\s*([A-Z]+[_-]\d+)\s*$',      # Solo FURN_8888
-        r'^\s*([A-Z]+\d+[_-]\d+)\s*$',   # Solo ABC123_456
+        r'^\s*([A-Z]+[_-]\d+)\s*$',
+        r'^\s*([A-Z]+\d+[_-]\d+)\s*$',
     ]
-    looks_like_code = False
-    extracted_code = None
+    
     for pattern in code_patterns:
         match = re.match(pattern, user_input.upper())
         if match:
-            looks_like_code = True
-            extracted_code = match.group(1)
-            break
+            code = match.group(1)
+            logger.info(f"Búsqueda MCP automática por código: '{code}'")
+            result = await execute_mcp_tool("search_records", {
+                "model": "product.product",
+                "domain": [["default_code", "=", code]],
+                "fields": ["name", "default_code", "list_price", "standard_price", "qty_available", "categ_id"],
+                "limit": 10
+            })
+            return result
     
-    # Detectar frases muy cortas (1-3 palabras) que NO son saludos/preguntas
+    # Detectar frases cortas
     is_excluded = any(excl in user_input_lower for excl in exclude_keywords)
     is_question = '?' in user_input
     word_count = len(user_input.split())
     
-    is_very_short_phrase = (
-        word_count <= 3 and 
-        not is_excluded and 
-        not is_question and 
-        not user_input.startswith('/')
-    )
-    
-    # SOLO activar detección automática para casos EXTREMADAMENTE SIMPLES:
-    # 1. Código directo: "FURN_8888"
-    # 2. Frase muy corta: "Drawer", "Office Lamp", "silla"
-    if looks_like_code:
-        # Caso 1: Código directo
-        logger.info(f"Búsqueda automática (código): '{extracted_code}'")
-        return execute_tool_call("odoo_search_products", query=extracted_code)
-    
-    elif is_very_short_phrase:
-        # Caso 2: Frase muy corta sin contexto adicional
+    if word_count <= 3 and not is_excluded and not is_question and not user_input.startswith('/'):
         query = user_input.strip()
-        logger.info(f"Búsqueda automática (frase corta): '{query}'")
-        return execute_tool_call("odoo_search_products", query=query)
+        logger.info(f"Búsqueda MCP automática: '{query}'")
+        result = await execute_mcp_tool("search_records", {
+            "model": "product.product",
+            "domain": [["name", "ilike", query]],
+            "fields": ["name", "default_code", "list_price", "standard_price", "qty_available", "categ_id"],
+            "limit": 10
+        })
+        return result
     
-    # Para TODO lo demás (consultas con contexto, preguntas, referencias, etc.)
-    # retornar None y dejar que el LLM decida la query de búsqueda
     return None
 
 
 # Crear el agente conversacional
-if tools:
-    # Con herramientas de Odoo
-    system_prompt = """Eres un asistente inteligente con acceso al sistema Odoo.
-
-**TU MISIÓN:**
-Ayudar a usuarios a encontrar información de productos en Odoo de forma natural y conversacional.
-
-**CUÁNDO USAR LAS HERRAMIENTAS:**
-- Cuando el usuario mencione o pregunte sobre un producto específico
-- Cuando el usuario quiera información de inventario, precios, stock
-- Cuando detectes que la pregunta requiere datos reales de Odoo
+if mcp_client:
+    # Con herramientas MCP de Odoo
+    # Nota: La lista de herramientas se cargará en el primer uso
+    tools_description = """
+- list_models: Lista todos los modelos disponibles en Odoo
+- search_records: Busca registros en un modelo con filtros
+- get_record: Obtiene un registro específico por ID
+- create_record: Crea un nuevo registro
+- update_record: Actualiza un registro existente
+- delete_record: Elimina un registro
+- execute_method: Ejecuta un método de un modelo
+- search_count: Cuenta registros que cumplen condiciones
+- get_model_fields: Obtiene campos de un modelo
+- model_info: Información sobre un modelo
+- server_status: Estado del servidor Odoo
+- cache_stats: Estadísticas de caché
+"""
+    
+    system_prompt = f"""Eres un asistente inteligente con acceso al sistema ERP Odoo a través de MCP.
 
 **HERRAMIENTAS DISPONIBLES:**
-- odoo_search_products: Busca productos por nombre, referencia o código
-- odoo_get_product_info: Obtiene detalles de un producto por su ID
+{tools_description}
 
-**CÓMO RESPONDER:**
-1. Si la pregunta es sobre productos → USA las herramientas para buscar en Odoo
-2. Presenta los resultados de forma clara y amigable
-3. Si no encuentras resultados → Explica de forma útil
-4. Para saludos o preguntas generales → Responde normalmente sin usar herramientas
+**CÓMO USAR LAS HERRAMIENTAS:**
+Usa la función call_mcp_tool con estos parámetros:
+- tool_name: nombre de la herramienta MCP a llamar
+- parameters: diccionario con los parámetros necesarios
+
+**EJEMPLOS DE USO:**
+
+1. Listar todos los modelos disponibles:
+   call_mcp_tool(tool_name="list_models", parameters={{}})
+
+2. Buscar productos por nombre:
+   call_mcp_tool(tool_name="search_records", parameters={{
+       "model": "product.product",
+       "domain": [["name", "ilike", "lamp"]],
+       "fields": ["name", "default_code", "list_price", "qty_available"],
+       "limit": 10
+   }})
+
+3. Obtener información de un producto específico:
+   call_mcp_tool(tool_name="get_record", parameters={{
+       "model": "product.product",
+       "record_id": 123,
+       "fields": ["name", "list_price", "qty_available"]
+   }})
+
+**CUÁNDO USAR CADA HERRAMIENTA:**
+- list_models: Cuando pregunten qué modelos/tablas hay disponibles
+- search_records: Para buscar registros (productos, clientes, etc.)
+- get_record: Para obtener detalles de un registro específico por ID
+- model_info: Para ver qué campos tiene un modelo
 
 **IMPORTANTE:**
-- NO inventes información de productos
-- NO digas "voy a buscar" o "déjame consultar"
-- SÉ directo pero amigable
-- USA las herramientas cuando tengas dudas sobre productos
+- SIEMPRE usa las herramientas para consultar datos reales de Odoo
+- NO inventes información
+- Presenta los resultados de forma clara y amigable
+- Si no encuentras resultados, explica de forma útil
 
 Responde de forma natural y profesional."""
 
-    # Vincular herramientas al modelo
-    model_with_tools = model.bind_tools(tools)
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "{input}")
-    ])
-    
-    # Cadena con modelo y herramientas
-    chain = prompt | model_with_tools | StrOutputParser()
-    logger.info(f"Agente inicializado con {len(tools)} herramientas de Odoo")
+    logger.info("Agente inicializado con cliente MCP (herramientas se cargarán en primer uso)")
 else:
-    # Sin herramientas
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "Eres un asistente inteligente y útil. Puedes responder preguntas, proporcionar información y ayudar con diversas tareas. Responde de manera clara, amigable y profesional."),
-        ("human", "{input}")
-    ])
-    chain = prompt | model | StrOutputParser()
-    logger.info("Agente inicializado sin herramientas (modo simple)")
+    system_prompt = "Eres un asistente inteligente y útil. Responde de manera clara, amigable y profesional."
+    logger.info("Agente inicializado sin herramientas")
 
 
-def run_agent(user_input: str) -> str:
+async def run_agent(user_input: str) -> str:
     """Ejecuta el agente con la entrada del usuario"""
     try:
-        # Si hay herramientas de Odoo, intentar ejecutarlas directamente (detección automática)
-        if tools:
-            tool_result = detect_and_execute_tools(user_input)
+        # Si hay cliente MCP, intentar detección automática primero
+        if mcp_client:
+            tool_result = await detect_and_execute_tools(user_input)
             if tool_result:
                 return tool_result
-        
-        # Si no se ejecutó ninguna herramienta automáticamente, usar el LLM con herramientas
-        if tools:
-            # Preparar mensajes para el LLM
+            
+            # Si no se detectó automáticamente, analizar si necesita herramientas MCP
+            # mediante el LLM pero sin bind_tools (manualmente)
+            
+            # Crear descripción de herramientas para el prompt
+            tools_json = []
+            for tool_info in mcp_tools_info:
+                tools_json.append({
+                    "name": tool_info["name"],
+                    "description": tool_info.get("description", ""),
+                    "parameters": tool_info.get("inputSchema", {})
+                })
+            
+            # Prompt que incluye las herramientas disponibles
+            enhanced_prompt = f"""{system_prompt}
+
+Para usar una herramienta, responde EXACTAMENTE en este formato JSON:
+{{
+    "action": "use_tool",
+    "tool_name": "nombre_herramienta",
+    "parameters": {{"param1": "valor1"}}
+}}
+
+Si NO necesitas usar herramientas, responde normalmente en texto.
+
+Herramientas disponibles (JSON):
+{tools_json}"""
+            
+            # Primera invocación del LLM
             messages = [
-                ("system", """Eres un asistente inteligente con acceso al sistema Odoo.
-
-**TU MISIÓN:**
-Ayudar a usuarios a encontrar información de productos en Odoo de forma natural y conversacional.
-
-**CUÁNDO USAR LAS HERRAMIENTAS:**
-- Cuando el usuario mencione o pregunte sobre un producto específico
-- Cuando el usuario quiera información de inventario, precios, stock
-- Cuando detectes que la pregunta requiere datos reales de Odoo
-
-**HERRAMIENTAS DISPONIBLES:**
-- odoo_search_products: Busca productos por nombre, referencia o código
-- odoo_get_product_info: Obtiene detalles de un producto por su ID
-
-**CÓMO RESPONDER:**
-1. Si la pregunta es sobre productos → USA las herramientas para buscar en Odoo
-2. Presenta los resultados de forma clara y amigable
-3. Si no encuentras resultados → Explica de forma útil
-4. Para saludos o preguntas generales → Responde normalmente sin usar herramientas
-
-**IMPORTANTE:**
-- NO inventes información de productos
-- NO digas "voy a buscar" o "déjame consultar"
-- SÉ directo pero amigable
-- USA las herramientas cuando tengas dudas sobre productos
-
-Responde de forma natural y profesional."""),
-                ("human", user_input)
+                {"role": "system", "content": enhanced_prompt},
+                {"role": "user", "content": user_input}
             ]
             
-            # Invocar el modelo con herramientas
-            response = model_with_tools.invoke([
-                {"role": "system", "content": messages[0][1]},
-                {"role": "user", "content": user_input}
-            ])
+            response = model.invoke(messages)
+            response_text = response.content
             
-            # Verificar si el LLM quiere usar herramientas
-            if hasattr(response, 'tool_calls') and response.tool_calls:
-                tool_messages = []
-                
-                # Ejecutar cada tool call
-                for tool_call in response.tool_calls:
-                    tool_name = tool_call['name']
-                    tool_args = tool_call['args']
+            # Verificar si el LLM quiere usar una herramienta
+            import json
+            import re
+            
+            # Buscar JSON en la respuesta
+            json_match = re.search(r'\{[\s\S]*"action"[\s\S]*"use_tool"[\s\S]*\}', response_text)
+            
+            if json_match:
+                try:
+                    tool_request = json.loads(json_match.group())
+                    tool_name = tool_request.get("tool_name")
+                    parameters = tool_request.get("parameters", {})
                     
-                    logger.info(f"LLM invocando herramienta: {tool_name} con args: {tool_args}")
+                    logger.info(f"LLM solicitó herramienta: {tool_name} con params: {parameters}")
                     
-                    # Ejecutar la herramienta correspondiente
-                    if tool_name == "odoo_search_products":
-                        tool_result = execute_tool_call(
-                            tool_name="odoo_search_products",
-                            query=tool_args.get('query'),
-                            limit=tool_args.get('limit', 50)
-                        )
-                    elif tool_name == "odoo_get_product_info":
-                        tool_result = execute_tool_call(
-                            tool_name="odoo_get_product_info",
-                            product_id=tool_args.get('product_id')
-                        )
-                    else:
-                        tool_result = f"Herramienta {tool_name} no soportada"
+                    # Ejecutar la herramienta MCP
+                    tool_result = await execute_mcp_tool(tool_name, parameters)
                     
-                    # Agregar el resultado como mensaje de herramienta
-                    tool_messages.append({
-                        "role": "tool",
-                        "content": tool_result,
-                        "tool_call_id": tool_call['id']
-                    })
-                
-                # Invocar el LLM nuevamente con los resultados de las herramientas
-                final_response = model.invoke([
-                    {"role": "system", "content": messages[0][1]},
-                    {"role": "user", "content": user_input},
-                    {"role": "assistant", "content": response.content or "", "tool_calls": response.tool_calls},
-                    *tool_messages
-                ])
-                
-                return final_response.content
+                    # Invocar el LLM nuevamente con el resultado
+                    messages.append({"role": "assistant", "content": response_text})
+                    messages.append({"role": "user", "content": f"Resultado de la herramienta: {tool_result}"})
+                    
+                    final_response = model.invoke(messages)
+                    return final_response.content
+                    
+                except json.JSONDecodeError:
+                    logger.warning("El LLM intentó usar herramienta pero el JSON era inválido")
+                    return response_text
             else:
-                # No usó herramientas, retornar respuesta directa
-                return response.content
-        else:
-            # Sin herramientas, usar cadena simple
-            response = chain.invoke({"input": user_input})
-            return response
+                # No necesita herramientas, respuesta directa
+                return response_text
+        
+        # Sin MCP, usar el LLM simple
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", user_input)
+        ])
+        
+        response = model.invoke(prompt_template.format_messages())
+        return response.content
         
     except Exception as e:
         logger.error(f"Error ejecutando agente: {e}", exc_info=True)

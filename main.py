@@ -69,7 +69,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.chat.send_action(action="typing")
         
-        response = run_agent(user_message)
+        response = await run_agent(user_message)
         
         await update.message.reply_text(response)
         logger.info(f"Respuesta enviada a {user.id}")
